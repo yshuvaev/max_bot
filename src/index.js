@@ -3,10 +3,20 @@
 require('dotenv').config();
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const TelegramBot = require('node-telegram-bot-api');
 const { Bot: MaxBot } = require('@maxhub/max-bot-api');
+
+let GramjsClient = null;
+let GramjsStringSession = null;
+try {
+  GramjsClient = require('telegram').TelegramClient;
+  GramjsStringSession = require('telegram/sessions').StringSession;
+} catch {
+  // gramjs not installed — MTProto large-video support disabled
+}
 
 const parseIntEnv = (name, fallback) => {
   const raw = process.env[name];
@@ -175,6 +185,8 @@ const getRouteIncludeFooter = (route) => {
 const telegram = new TelegramBot(appConfig.telegramToken, { polling: true });
 const maxBot = new MaxBot(appConfig.maxToken);
 
+const BOT_API_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MB hard limit of the public Telegram Bot API
+
 const state = {
   queue: [],
   queueBusy: false,
@@ -182,6 +194,8 @@ const state = {
   maxBotUserId: null,
   droppedSourceLogs: new Map(),
 };
+
+let mtprotoClient = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -235,36 +249,38 @@ const resolveDocumentKind = (document) => {
   return 'file';
 };
 
-const buildMediaCandidates = (messageLike, label) => {
+const buildMediaCandidates = (messageLike, label, tgChatId, tgMessageId) => {
   const results = [];
   if (!messageLike) return results;
+
+  const ctx = { tgChatId: tgChatId || null, tgMessageId: tgMessageId || null };
 
   if (Array.isArray(messageLike.photo) && messageLike.photo.length) {
     for (let i = messageLike.photo.length - 1; i >= 0; i -= 1) {
       const photo = messageLike.photo[i];
       if (!hasValidFileId(photo?.file_id)) continue;
-      results.push({ label, kind: 'image', fileId: photo.file_id });
+      results.push({ label, kind: 'image', fileId: photo.file_id, fileSize: photo.file_size || 0, mime: 'image/jpeg', ...ctx });
     }
   }
 
   if (hasValidFileId(messageLike.video?.file_id)) {
-    results.push({ label, kind: 'video', fileId: messageLike.video.file_id });
+    results.push({ label, kind: 'video', fileId: messageLike.video.file_id, fileSize: messageLike.video.file_size || 0, mime: messageLike.video.mime_type || 'video/mp4', ...ctx });
   }
 
   if (hasValidFileId(messageLike.animation?.file_id)) {
-    results.push({ label, kind: 'video', fileId: messageLike.animation.file_id });
+    results.push({ label, kind: 'video', fileId: messageLike.animation.file_id, fileSize: messageLike.animation.file_size || 0, mime: messageLike.animation.mime_type || 'video/mp4', ...ctx });
   }
 
   if (hasValidFileId(messageLike.audio?.file_id)) {
-    results.push({ label, kind: 'audio', fileId: messageLike.audio.file_id });
+    results.push({ label, kind: 'audio', fileId: messageLike.audio.file_id, fileSize: messageLike.audio.file_size || 0, mime: messageLike.audio.mime_type || 'audio/mpeg', ...ctx });
   }
 
   if (hasValidFileId(messageLike.voice?.file_id)) {
-    results.push({ label, kind: 'audio', fileId: messageLike.voice.file_id });
+    results.push({ label, kind: 'audio', fileId: messageLike.voice.file_id, fileSize: messageLike.voice.file_size || 0, mime: 'audio/ogg', ...ctx });
   }
 
   if (hasValidFileId(messageLike.video_note?.file_id)) {
-    results.push({ label, kind: 'video', fileId: messageLike.video_note.file_id });
+    results.push({ label, kind: 'video', fileId: messageLike.video_note.file_id, fileSize: messageLike.video_note.file_size || 0, mime: 'video/mp4', ...ctx });
   }
 
   if (hasValidFileId(messageLike.document?.file_id)) {
@@ -272,6 +288,9 @@ const buildMediaCandidates = (messageLike, label) => {
       label,
       kind: resolveDocumentKind(messageLike.document),
       fileId: messageLike.document.file_id,
+      fileSize: messageLike.document.file_size || 0,
+      mime: messageLike.document.mime_type || 'application/octet-stream',
+      ...ctx,
     });
   }
 
@@ -469,6 +488,148 @@ const isTooBigTelegramError = (err) => {
   return /file is too big/i.test(text);
 };
 
+// ---------------------------------------------------------------------------
+// MTProto layer — used to download video files that exceed the 20 MB Bot API cap
+// ---------------------------------------------------------------------------
+
+const initMtprotoClient = async () => {
+  if (!GramjsClient || !GramjsStringSession) {
+    log('gramjs not available; large video downloads via MTProto disabled');
+    return;
+  }
+
+  const apiId = Number.parseInt(process.env.TELEGRAM_API_ID || '0', 10);
+  const apiHash = process.env.TELEGRAM_API_HASH || '';
+  if (!apiId || !apiHash) {
+    log('TELEGRAM_API_ID / TELEGRAM_API_HASH not set; MTProto disabled');
+    return;
+  }
+
+  const sessionFile = path.resolve(
+    process.cwd(),
+    process.env.TELEGRAM_MTPROTO_SESSION_FILE || '.mtproto_session',
+  );
+  const sessionString = fs.existsSync(sessionFile) ? fs.readFileSync(sessionFile, 'utf8').trim() : '';
+
+  const client = new GramjsClient(
+    new GramjsStringSession(sessionString),
+    apiId,
+    apiHash,
+    { connectionRetries: 5, retryDelay: 1000 },
+  );
+
+  await client.start({ botAuthToken: appConfig.telegramToken });
+
+  const saved = client.session.save();
+  if (saved !== sessionString) {
+    fs.writeFileSync(sessionFile, saved, 'utf8');
+    log('MTProto session saved', { path: sessionFile });
+  }
+
+  // Bots cannot call messages.GetDialogs, so we pre-seed entity cache
+  // by resolving every source channel/group from routes.json directly.
+  const sources = routingConfig.routes
+    .filter((r) => r.enabled !== false && r.source.network === 'telegram')
+    .map((r) => r.source);
+
+  let seeded = 0;
+  for (const source of sources) {
+    try {
+      if (source.chat_username) {
+        await client.getInputEntity(source.chat_username);
+        seeded += 1;
+      }
+    } catch (err) {
+      log('MTProto entity pre-seed skipped', {
+        chat_id: source.chat_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  log('MTProto client ready', { seeded_entities: seeded });
+
+  mtprotoClient = client;
+};
+
+const makeProgressLogger = (label) => {
+  let lastPct = -1;
+  return (received, total) => {
+    if (!total) return;
+    const pct = Math.floor(Number(received) / Number(total) * 100);
+    if (pct >= lastPct + 25) {
+      lastPct = pct;
+      log(`${label} ${pct}%`, { received_mb: Math.round(Number(received) / 1048576) });
+    }
+  };
+};
+
+const downloadViaMtproto = async (candidate) => {
+  if (!mtprotoClient) throw new Error('MTProto client not initialized');
+
+  let entity;
+  try {
+    entity = await mtprotoClient.getInputEntity(candidate.tgChatId);
+  } catch (err) {
+    throw new Error(`MTProto entity resolution failed for chat ${candidate.tgChatId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  const messages = await mtprotoClient.getMessages(entity, { ids: [candidate.tgMessageId] });
+  if (!messages || !messages[0]) {
+    throw new Error(`MTProto: message ${candidate.tgMessageId} not found in chat ${candidate.tgChatId}`);
+  }
+
+  const mimeExt = candidate.mime ? candidate.mime.split('/')[1] : 'mp4';
+  const ext = `.${mimeExt.replace(/[^a-z0-9]/gi, '') || 'mp4'}`;
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `tg_bridge_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`,
+  );
+
+  await mtprotoClient.downloadMedia(messages[0], {
+    outputFile: tmpFile,
+    progressCallback: makeProgressLogger('MTProto download'),
+  });
+
+  return tmpFile;
+};
+
+const uploadLargeMediaViaMtproto = async (candidate) => {
+  let tmpFile = null;
+  try {
+    log('MTProto fallback: starting download', {
+      chat_id: candidate.tgChatId,
+      message_id: candidate.tgMessageId,
+      file_size_mb: candidate.fileSize ? Math.round(candidate.fileSize / 1048576) : 'unknown',
+    });
+
+    tmpFile = await downloadViaMtproto(candidate);
+    log('MTProto download complete, uploading to MAX', { tmp: path.basename(tmpFile) });
+
+    let result;
+    if (candidate.kind === 'video') {
+      result = await maxBot.api.uploadVideo({ source: tmpFile });
+    } else if (candidate.kind === 'audio') {
+      result = await maxBot.api.uploadAudio({ source: tmpFile });
+    } else {
+      result = await maxBot.api.uploadFile({ source: tmpFile });
+    }
+
+    log('MTProto media uploaded to MAX', {
+      chat_id: candidate.tgChatId,
+      message_id: candidate.tgMessageId,
+    });
+
+    return result.toJson();
+  } finally {
+    if (tmpFile) {
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore cleanup errors */ }
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+
 const tgResolveFileLocation = async (fileId) => {
   const endpoint = `${appConfig.telegramApiBaseUrl}/bot${appConfig.telegramToken}/getFile`;
   const response = await fetch(`${endpoint}?file_id=${encodeURIComponent(fileId)}`);
@@ -501,30 +662,91 @@ const tgResolveFileLocation = async (fileId) => {
   };
 };
 
-const uploadMediaCandidate = async (candidate) => {
-  const location = await tgResolveFileLocation(candidate.fileId);
-  const input = location.type === 'source'
-    ? { source: location.value }
-    : { url: location.value };
+const canUseMtprotoFallback = (candidate) =>
+  Boolean(mtprotoClient && candidate.tgChatId && candidate.tgMessageId);
 
-  if (candidate.kind === 'image') {
-    return (await maxBot.api.uploadImage(input)).toJson();
+// @maxhub/max-bot-api's uploadVideo/uploadAudio/uploadFile only accept a local
+// source (file path string). Internally they use a ReadStream → chunked Content-Range
+// upload to MAX, which is the only supported path for video.
+// uploadImage is the only method that supports passing a URL directly.
+// So for non-image media we must download to a temp file on disk first.
+const downloadUrlToTempFile = async (url, mime) => {
+  const mimeExt = mime ? mime.split('/')[1] : 'bin';
+  const ext = `.${mimeExt.replace(/[^a-z0-9]/gi, '') || 'bin'}`;
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `tg_bridge_dl_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`,
+  );
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Telegram file download failed: HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(tmpFile, buffer);
+  return tmpFile;
+};
+
+const uploadMediaCandidate = async (candidate) => {
+  // Pre-check: known large files bypass Bot API and go straight to MTProto
+  if (
+    candidate.fileSize > BOT_API_MAX_DOWNLOAD_BYTES
+    && candidate.kind !== 'image'
+    && canUseMtprotoFallback(candidate)
+  ) {
+    return uploadLargeMediaViaMtproto(candidate);
   }
-  if (candidate.kind === 'video') {
-    return (await maxBot.api.uploadVideo(input)).toJson();
+
+  try {
+    const location = await tgResolveFileLocation(candidate.fileId);
+
+    if (candidate.kind === 'image') {
+      // uploadImage supports a URL passthrough natively
+      const input = location.type === 'source'
+        ? { source: location.value }
+        : { url: location.value };
+      return (await maxBot.api.uploadImage(input)).toJson();
+    }
+
+    // For video/audio/file: must be a local file path (string) so the library uses
+    // ReadStream → chunked Content-Range upload path, not the multipart Buffer path
+    // which the MAX server rejects with XML instead of JSON.
+    let tmpFile = null;
+    try {
+      const source = location.type === 'source'
+        ? location.value
+        : (tmpFile = await downloadUrlToTempFile(location.value, candidate.mime));
+
+      if (candidate.kind === 'video') {
+        return (await maxBot.api.uploadVideo({ source })).toJson();
+      }
+      if (candidate.kind === 'audio') {
+        return (await maxBot.api.uploadAudio({ source })).toJson();
+      }
+      return (await maxBot.api.uploadFile({ source })).toJson();
+    } finally {
+      if (tmpFile) {
+        try { fs.unlinkSync(tmpFile); } catch { /* ignore cleanup errors */ }
+      }
+    }
+  } catch (err) {
+    if (isTooBigTelegramError(err) && canUseMtprotoFallback(candidate)) {
+      log('Bot API "file too big", falling back to MTProto download', {
+        kind: candidate.kind,
+        file_size: candidate.fileSize,
+      });
+      return uploadLargeMediaViaMtproto(candidate);
+    }
+    throw err;
   }
-  if (candidate.kind === 'audio') {
-    return (await maxBot.api.uploadAudio(input)).toJson();
-  }
-  return (await maxBot.api.uploadFile(input)).toJson();
 };
 
 const buildAttachmentsFromTelegram = async (message) => {
   const candidates = getMessageCandidates(message);
   const mediaCandidates = [
-    ...buildMediaCandidates(candidates[0], 'message'),
-    ...buildMediaCandidates(candidates[1], 'reply_to_message'),
-    ...buildMediaCandidates(candidates[2], 'external_reply'),
+    ...buildMediaCandidates(candidates[0], 'message', message.chat.id, message.message_id),
+    ...buildMediaCandidates(candidates[1], 'reply_to_message',
+      message.reply_to_message?.chat?.id || message.chat.id,
+      message.reply_to_message?.message_id || null,
+    ),
+    ...buildMediaCandidates(candidates[2], 'external_reply', null, null),
   ];
 
   if (!mediaCandidates.length) {
@@ -828,6 +1050,12 @@ const onMaxMessage = (ctx) => {
 };
 
 const bootstrap = async () => {
+  await initMtprotoClient().catch((err) => {
+    log('MTProto init failed (non-fatal, large videos will show warning)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
   const [tgMe, maxMe] = await Promise.all([
     telegram.getMe(),
     maxBot.api.getMyInfo(),
