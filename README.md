@@ -1,8 +1,8 @@
-# Telegram → MAX Bridge Bot
+# Telegram / API → MAX Bridge Bot
 
 **[Русский](README.ru.md)** | English
 
-A lightweight Node.js bridge that automatically reposts messages from **Telegram** channels and groups to **MAX** (max.ru) channels, including text formatting, images, videos, audio, and file attachments.
+A lightweight Node.js bridge that automatically reposts messages from **Telegram** channels/groups and **external API sources** to **MAX** (max.ru) and **Telegram** channels, including text formatting, images, videos, audio, and file attachments.
 
 ---
 
@@ -15,6 +15,7 @@ A lightweight Node.js bridge that automatically reposts messages from **Telegram
 - **Media albums** — Telegram `media_group` arrives as a single MAX message with multiple attachments
 - **Source footer** — optional "tg: [Channel](link)" footer on every reposted message
 - **Multiple routes** — fan-out from one source to many destinations, or many independent routes
+- **API ingest** — accept messages from external sources via authenticated HTTP endpoint (`POST /api/message`)
 - **Queue with delay** — configurable per-route repost delay to avoid rate limits
 - **Groups & supergroups** — works with Telegram channels, groups, and supergroups as sources
 
@@ -79,6 +80,10 @@ REMOTE_PASSWORD=secret          # leave empty to use SSH key auth
 TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 
+# ── Optional – API ingest endpoint ───────────────────────────────────────────
+# API_PORT=3000                          # HTTP server port (started automatically)
+# API_KEY_MY_ROUTE=<random-secret>       # Bearer token for a route with api_key_env="API_KEY_MY_ROUTE"
+
 # ── Optional – advanced ──────────────────────────────────────────────────────
 # TELEGRAM_API_BASE_URL=https://api.telegram.org
 # ROUTING_CONFIG_PATH=config/routes.json
@@ -119,6 +124,37 @@ Routes live in `config/routes.json` (gitignored — generated per deployment).
   ]
 }
 ```
+
+### API source
+
+To accept messages from external systems (CI/CD, monitoring, other bots), use `"network": "api"`:
+
+```jsonc
+{
+  "id": "alerts_to_max",
+  "enabled": true,
+  "source": {
+    "network": "api",
+    "api_key_env": "API_KEY_ALERTS"   // name of the env var holding the Bearer token
+  },
+  "destinations": [
+    { "network": "max", "chat_id": -70999000000000 },
+    { "network": "telegram", "chat_id": -1001234567890 }
+  ],
+  "options": { "repost_delay_ms": 0 }
+}
+```
+
+The HTTP server starts automatically when at least one API route is present. Send messages with:
+
+```bash
+curl -X POST http://your-server:3000/api/message \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_KEY_ALERTS" \
+  -d '{"text": "**Alert:** deploy finished"}'
+```
+
+Text supports markdown: `**bold**`, `_italic_`, `` `code` ``, `~~strike~~`, `[link](url)`, and fenced code blocks.
 
 ---
 
