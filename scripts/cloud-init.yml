@@ -1,0 +1,43 @@
+#cloud-config
+# Bootstrap for Hetzner CAX11 / Ubuntu 24.04 running max-repost-bot.
+# Installs Node 20, pm2, basic firewall, creates /opt/max_bot.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - ufw
+  - rsync
+  - jq
+
+write_files:
+  - path: /etc/sysctl.d/99-max-bot.conf
+    content: |
+      net.ipv4.tcp_keepalive_time = 60
+      net.ipv4.tcp_keepalive_intvl = 10
+      net.ipv4.tcp_keepalive_probes = 6
+    permissions: '0644'
+
+runcmd:
+  # NodeSource apt repo for Node 20 LTS (supports arm64)
+  - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  - apt-get install -y nodejs
+  # pm2 global
+  - npm install -g pm2
+  - pm2 startup systemd -u root --hp /root
+  # Project dir
+  - mkdir -p /opt/max_bot/src /opt/max_bot/scripts /opt/max_bot/config
+  # Firewall: SSH + API ingest port (3000). TG/MAX egress allowed by default.
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw allow 3000/tcp
+  - ufw --force enable
+  # Apply sysctl
+  - sysctl --system
+  - echo "cloud-init bootstrap done" > /var/log/max-bot-bootstrap.log
+
+final_message: "max-bot bootstrap complete after $UPTIME seconds"

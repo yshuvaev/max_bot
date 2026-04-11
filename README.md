@@ -158,6 +158,110 @@ Text supports markdown: `**bold**`, `_italic_`, `` `code` ``, `~~strike~~`, `[li
 
 ---
 
+## Bridge CLI (`max-bot-bridge`)
+
+A built-in command-line tool to manage bridging routes **live** without
+editing `routes.json` by hand or redeploying. Works against any bot
+instance with `ADMIN_PASSWORD` set in its `.env`.
+
+### Enable the admin API
+
+On the **bot server**, add to `.env`:
+
+```dotenv
+ADMIN_PASSWORD=<a-long-random-secret>   # leave empty to fully disable the admin API
+# API_PORT=3000                          # default; change if :3000 is already taken
+```
+
+Restart the bot. When the admin API is enabled, `/admin/*` endpoints are
+served on the same HTTP port as the API ingest endpoint (`API_PORT`,
+default `3000`).
+
+> ⚠️  **Security.** The admin API speaks plaintext HTTP. Before exposing
+> it to the public internet, either put it behind TLS (Caddy, Nginx) or
+> tunnel it over SSH:
+> ```bash
+> ssh -L 3000:localhost:3000 root@your-bot
+> max-bot-bridge login localhost
+> ```
+
+### Use the CLI
+
+```bash
+# On your laptop, anywhere the repo is cloned and `npm install`ed:
+npx max-bot-bridge                       # interactive TUI (recommended)
+npx max-bot-bridge --help                # full command reference
+npx max-bot-bridge login 157.180.120.151 # password prompted interactively
+npx max-bot-bridge list                  # list all routes
+npx max-bot-bridge show my_route
+npx max-bot-bridge disable my_route
+npx max-bot-bridge enable  my_route
+npx max-bot-bridge add                   # wizard: source, destinations, options
+npx max-bot-bridge edit    my_route
+npx max-bot-bridge remove  my_route      # prompts; --force skips confirmation
+```
+
+Running `max-bot-bridge` with **no arguments** opens an arrow-key menu:
+
+```
+╭────────────────────────────────────────╮
+│      max-bot-bridge — bridge CLI       │
+╰────────────────────────────────────────╯
+
+server: http://157.180.120.151:3000
+routes: 9 enabled / 9 total
+
+? Main menu
+❯ 📋  List all routes
+  🔧  Manage a route (edit / enable / disable / delete)
+  ➕  Add a new route
+  👤  Who am I / session info
+  🚪  Logout
+  ❌  Quit
+```
+
+### Session storage
+
+After successful `login`, a long-lived Bearer token (~1 year) is stored
+at `~/.config/max-bot-bridge/session.json` (mode `0600`). Passwords are
+never written to disk. Use `logout` to revoke and wipe.
+
+### Scripting & LLM-friendly mode
+
+```bash
+MAX_BOT_BRIDGE_PASSWORD=$PW max-bot-bridge login 10.0.0.5 \
+  --password "$MAX_BOT_BRIDGE_PASSWORD"
+
+max-bot-bridge list --json | jq '.[] | {id, enabled}'
+max-bot-bridge show my_route --json
+```
+
+Exit codes: `0` success, `1` generic, `2` auth error, `3` not found.
+
+### HTTP endpoints (for curl / custom tooling)
+
+All endpoints expect JSON bodies. After `POST /admin/login` returns a
+token, set `Authorization: Bearer <token>` on every subsequent request.
+
+| Method | Path                              | Body                 | Notes                                 |
+|--------|-----------------------------------|----------------------|---------------------------------------|
+| POST   | `/admin/login`                    | `{password}`         | 5 attempts/min/IP rate limit          |
+| POST   | `/admin/logout`                   | –                    | revokes the current token             |
+| GET    | `/admin/info`                     | –                    | route counts + session expiry         |
+| GET    | `/admin/routes`                   | –                    | all routes                            |
+| GET    | `/admin/routes/:id`               | –                    | one route                             |
+| POST   | `/admin/routes`                   | full route object    | create; validates before persisting   |
+| PUT    | `/admin/routes/:id`               | partial route object | merge-update; writes+reloads atomic   |
+| DELETE | `/admin/routes/:id`               | –                    | remove                                |
+| POST   | `/admin/routes/:id/enable`        | –                    | toggle enabled=true                   |
+| POST   | `/admin/routes/:id/disable`       | –                    | toggle enabled=false                  |
+
+Every mutation atomically rewrites `routes.json` and hot-reloads the bot
+(no process restart). If the new config fails validation, the previous
+file is restored and the API returns `400` with the error.
+
+---
+
 ## Managing bridges
 
 ### `/chatid` command

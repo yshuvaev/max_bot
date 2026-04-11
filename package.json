@@ -3,17 +3,23 @@
   "version": "1.0.0",
   "description": "Bridge bot: repost from Telegram to MAX with delay",
   "main": "src/index.js",
+  "bin": {
+    "max-bot-bridge": "./bin/max-bot-bridge.js"
+  },
   "scripts": {
     "bridge": "./bridge.sh",
     "bridge:discover": "node scripts/bridge-init.js --merge",
     "bridge:pair": "node scripts/bridge-init.js --add-pair",
+    "bridge:cli": "node ./bin/max-bot-bridge.js",
     "start": "node src/index.js"
   },
   "engines": {
     "node": ">=18.18.0"
   },
   "dependencies": {
+    "@inquirer/prompts": "^7.10.1",
     "@maxhub/max-bot-api": "^0.2.2",
+    "commander": "^12.1.0",
     "dotenv": "^16.4.7",
     "node-telegram-bot-api": "^0.66.0",
     "telegram": "^2.26.22"

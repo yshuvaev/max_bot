@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.bak*
 npm-debug.log*
 config/routes.json
+config/discovered-chats.json
 .mtproto_session

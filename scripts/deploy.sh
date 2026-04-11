@@ -50,13 +50,16 @@ fi
 
 echo "Preparing ${REMOTE_HOST}:${APP_DIR}"
 REMOTE_ROUTING_DIR="${APP_DIR}/$(dirname "${ROUTING_CONFIG_PATH}")"
-"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/scripts' '${APP_DIR}/config' '${REMOTE_ROUTING_DIR}'"
+"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/src/admin' '${APP_DIR}/src/cli' '${APP_DIR}/bin' '${APP_DIR}/scripts' '${APP_DIR}/config' '${REMOTE_ROUTING_DIR}'"
 
 echo "Uploading files"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package-lock.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package-lock.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/ecosystem.config.js" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/ecosystem.config.js"
 "${SCP_CMD[@]}" "${ROOT_DIR}/src/index.js" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/src/index.js"
+"${SCP_CMD[@]}" -r "${ROOT_DIR}/src/admin/" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/src/"
+"${SCP_CMD[@]}" -r "${ROOT_DIR}/src/cli/" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/src/"
+"${SCP_CMD[@]}" -r "${ROOT_DIR}/bin/" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/"
 "${SCP_CMD[@]}" "${LOCAL_ROUTING_PATH}" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/${ROUTING_CONFIG_PATH}"
 "${SCP_CMD[@]}" "${ROOT_DIR}/.env" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/.env"
 

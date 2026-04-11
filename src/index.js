@@ -11,6 +11,8 @@ const path = require('node:path');
 const TelegramBot = require('node-telegram-bot-api');
 const { Bot: MaxBot } = require('@maxhub/max-bot-api');
 
+const { createAdminHandler } = require('./admin/http');
+
 let GramjsClient = null;
 let GramjsStringSession = null;
 try {
@@ -62,6 +64,7 @@ const appConfig = {
   defaultMediaGroupCollectMs: parseIntEnv('DEFAULT_MEDIA_GROUP_COLLECT_MS', 1200),
   defaultIncludeTelegramFooter: parseBooleanEnv('DEFAULT_INCLUDE_TELEGRAM_FOOTER', true),
   apiPort: parseIntEnv('API_PORT', 3000),
+  adminPassword: process.env.ADMIN_PASSWORD || '',
 };
 
 if (appConfig.defaultRepostDelayMs < 0) {
@@ -202,7 +205,21 @@ const loadRoutingConfig = (configPath) => {
   };
 };
 
-const routingConfig = loadRoutingConfig(appConfig.routingConfigPath);
+let routingConfig = loadRoutingConfig(appConfig.routingConfigPath);
+
+/**
+ * Re-reads routes.json from disk and replaces the in-memory routingConfig.
+ * Used by the admin HTTP API after every mutation so the bot picks up changes
+ * without a process restart. If the new file fails validation, the caller
+ * is responsible for restoring the previous file — this function will rethrow.
+ */
+const reloadRoutingConfig = () => {
+  routingConfig = loadRoutingConfig(appConfig.routingConfigPath);
+  log('Routing config reloaded', {
+    routes_total: routingConfig.routes.length,
+    routes_enabled: routingConfig.routes.filter((r) => r.enabled !== false).length,
+  });
+};
 
 const getRouteDelayMs = (route) => {
   if (typeof route.options.repost_delay_ms === 'number') return route.options.repost_delay_ms;
@@ -1492,10 +1509,53 @@ const bootstrap = async () => {
   log('MAX listener started', { allowedUpdates });
 
   const apiRoutes = getEnabledRoutes().filter((r) => r.source.network === 'api');
-  if (apiRoutes.length > 0) {
-    const server = http.createServer(handleApiRequest);
+  const adminEnabled = Boolean(appConfig.adminPassword);
+
+  const adminHandler = adminEnabled
+    ? createAdminHandler({
+      adminPassword: appConfig.adminPassword,
+      routingConfigPath: appConfig.routingConfigPath,
+      getRoutingConfig: () => routingConfig,
+      reloadRoutingConfig,
+      log,
+    })
+    : null;
+
+  if (apiRoutes.length > 0 || adminEnabled) {
+    const server = http.createServer((req, res) => {
+      let pathname = '/';
+      try {
+        pathname = new URL(req.url || '/', 'http://localhost').pathname;
+      } catch {
+        pathname = req.url || '/';
+      }
+
+      if (adminHandler && pathname.startsWith('/admin')) {
+        adminHandler.handle(req, res, pathname).catch((err) => {
+          log('Admin handler error', { error: err instanceof Error ? err.message : String(err) });
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal server error' }));
+          }
+        });
+        return;
+      }
+
+      handleApiRequest(req, res).catch((err) => {
+        log('API handler error', { error: err instanceof Error ? err.message : String(err) });
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal server error' }));
+        }
+      });
+    });
+
     server.listen(appConfig.apiPort, () => {
-      log('API HTTP server listening', { port: appConfig.apiPort, api_routes: apiRoutes.length });
+      log('HTTP server listening', {
+        port: appConfig.apiPort,
+        api_routes: apiRoutes.length,
+        admin_enabled: adminEnabled,
+      });
     });
   }
 };

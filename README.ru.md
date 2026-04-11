@@ -164,6 +164,110 @@ curl -X POST http://your-server:3000/api/message \
 
 ---
 
+## CLI моста (`max-bot-bridge`)
+
+Встроенный CLI-инструмент для **живого** управления маршрутами без правки
+`routes.json` вручную и без редеплоя. Работает с любым инстансом бота,
+у которого в `.env` задан `ADMIN_PASSWORD`.
+
+### Включить admin-API
+
+На **сервере бота** добавить в `.env`:
+
+```dotenv
+ADMIN_PASSWORD=<длинный-случайный-секрет>   # пусто = admin-API полностью выключен
+# API_PORT=3000                              # по умолчанию; смени, если 3000 занят
+```
+
+Перезапустить бота. Когда admin-API включён, `/admin/*` висит на том же
+HTTP-порту, что и API-ingest (`API_PORT`, по умолчанию `3000`).
+
+> ⚠️  **Безопасность.** Admin-API ходит по **plain HTTP**. Перед тем как
+> торчать им в публичный интернет, либо поставь TLS-прокси (Caddy, Nginx),
+> либо тунелируй через SSH:
+> ```bash
+> ssh -L 3000:localhost:3000 root@your-bot
+> max-bot-bridge login localhost
+> ```
+
+### Как пользоваться
+
+```bash
+# На твоей машине, где склонирован репозиторий и запущен npm install:
+npx max-bot-bridge                       # интерактивный TUI (рекомендуется)
+npx max-bot-bridge --help                # полное описание команд
+npx max-bot-bridge login 157.180.120.151 # пароль спросит интерактивно
+npx max-bot-bridge list                  # все маршруты
+npx max-bot-bridge show my_route
+npx max-bot-bridge disable my_route
+npx max-bot-bridge enable  my_route
+npx max-bot-bridge add                   # визард: источник, назначения, опции
+npx max-bot-bridge edit    my_route
+npx max-bot-bridge remove  my_route      # спрашивает подтверждение; --force пропускает
+```
+
+Запуск `max-bot-bridge` **без аргументов** — интерактивное меню со стрелками:
+
+```
+╭────────────────────────────────────────╮
+│      max-bot-bridge — bridge CLI       │
+╰────────────────────────────────────────╯
+
+server: http://157.180.120.151:3000
+routes: 9 enabled / 9 total
+
+? Main menu
+❯ 📋  List all routes
+  🔧  Manage a route (edit / enable / disable / delete)
+  ➕  Add a new route
+  👤  Who am I / session info
+  🚪  Logout
+  ❌  Quit
+```
+
+### Хранение сессии
+
+После успешного `login` долгоживущий Bearer-токен (~1 год) сохраняется в
+`~/.config/max-bot-bridge/session.json` (права `0600`). **Пароль на диск
+не пишется.** `logout` отзывает токен на сервере и стирает локальный файл.
+
+### Скрипты и LLM-дружественный режим
+
+```bash
+MAX_BOT_BRIDGE_PASSWORD=$PW max-bot-bridge login 10.0.0.5 \
+  --password "$MAX_BOT_BRIDGE_PASSWORD"
+
+max-bot-bridge list --json | jq '.[] | {id, enabled}'
+max-bot-bridge show my_route --json
+```
+
+Exit-коды: `0` — успех, `1` — generic, `2` — ошибка авторизации, `3` — не найдено.
+
+### HTTP-эндпоинты (для curl / своих скриптов)
+
+Все эндпоинты ждут JSON в теле. После `POST /admin/login` возвращается
+токен — его нужно подставлять в `Authorization: Bearer <token>` на всех
+последующих запросах.
+
+| Метод  | Путь                              | Тело                 | Примечания                              |
+|--------|-----------------------------------|----------------------|-----------------------------------------|
+| POST   | `/admin/login`                    | `{password}`         | лимит: 5 попыток/мин/IP                 |
+| POST   | `/admin/logout`                   | –                    | отзывает текущий токен                  |
+| GET    | `/admin/info`                     | –                    | счётчики маршрутов + срок сессии        |
+| GET    | `/admin/routes`                   | –                    | все маршруты                            |
+| GET    | `/admin/routes/:id`               | –                    | один маршрут                            |
+| POST   | `/admin/routes`                   | полный объект route  | создать; валидация до записи            |
+| PUT    | `/admin/routes/:id`               | частичный route      | merge-update, атомарная запись+reload   |
+| DELETE | `/admin/routes/:id`               | –                    | удалить                                 |
+| POST   | `/admin/routes/:id/enable`        | –                    | включить                                |
+| POST   | `/admin/routes/:id/disable`       | –                    | выключить                               |
+
+Каждая мутация атомарно перезаписывает `routes.json` и **горячо** применяется
+ботом (без рестарта процесса). Если новый конфиг не проходит валидацию —
+файл восстанавливается из резервной копии, API возвращает `400` с ошибкой.
+
+---
+
 ## Управление мостами
 
 ### Команда `/chatid`
