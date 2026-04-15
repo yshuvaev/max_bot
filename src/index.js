@@ -160,6 +160,10 @@ const validateRoute = (route, index) => {
     assert(typeof route.options.include_telegram_footer === 'boolean', `routes[${id}].options.include_telegram_footer must be boolean`);
   }
 
+  if (route.options && route.options.include_sender_name !== undefined) {
+    assert(typeof route.options.include_sender_name === 'boolean', `routes[${id}].options.include_sender_name must be boolean`);
+  }
+
   return {
     id,
     enabled: route.enabled !== false,
@@ -677,6 +681,17 @@ const getTelegramFooter = (message, route) => {
   return `tg: [${escapeMarkdownText(sourceLink.name)}](${sourceLink.url})`;
 };
 
+const getSenderName = (message) => {
+  const from = message.from || message.sender_chat;
+  if (!from) return '';
+  if (from.first_name || from.last_name) {
+    return [from.first_name, from.last_name].filter(Boolean).join(' ');
+  }
+  if (from.title) return from.title;
+  if (from.username) return from.username;
+  return '';
+};
+
 const getTelegramMessageText = (message, route, warningText = '') => {
   const own = extractTextAndEntities(message);
   const repostSource = chooseTextSource(message);
@@ -684,6 +699,12 @@ const getTelegramMessageText = (message, route, warningText = '') => {
   const footer = getTelegramFooter(message, route);
 
   const parts = [];
+
+  if (route.options.include_sender_name) {
+    const name = getSenderName(message);
+    if (name) parts.push(`**${escapeMarkdownText(name)}:**`);
+  }
+
   if (own.text) parts.push(formatTelegramTextAsMarkdown(own.text, own.entities));
   if (repost.text) parts.push(formatTelegramTextAsMarkdown(repost.text, repost.entities));
   if (warningText) parts.push(escapeMarkdownText(warningText));
