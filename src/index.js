@@ -131,6 +131,27 @@ const validateDestination = (routeId, destination, index) => {
     return;
   }
 
+  if (destination.network === 'youtube') {
+    const clientIdEnv = destination.client_id_env || 'YOUTUBE_CLIENT_ID';
+    const clientSecretEnv = destination.client_secret_env || 'YOUTUBE_CLIENT_SECRET';
+    const refreshTokenEnv = destination.refresh_token_env || 'YOUTUBE_REFRESH_TOKEN';
+    assert(process.env[clientIdEnv], `${prefix}: env var ${clientIdEnv} is not set (YouTube client_id)`);
+    assert(process.env[clientSecretEnv], `${prefix}: env var ${clientSecretEnv} is not set (YouTube client_secret)`);
+    assert(process.env[refreshTokenEnv], `${prefix}: env var ${refreshTokenEnv} is not set (YouTube refresh_token)`);
+    return;
+  }
+
+  if (destination.network === 'vk') {
+    ensureNumber(destination.owner_id, `${prefix}.owner_id`);
+    const hasInline = typeof destination.access_token === 'string' && destination.access_token.length > 0;
+    const hasEnv = typeof destination.access_token_env === 'string' && destination.access_token_env.length > 0;
+    assert(hasInline || hasEnv, `${prefix}: set access_token (inline) or access_token_env (env var name) for vk destination`);
+    if (hasEnv) {
+      assert(process.env[destination.access_token_env], `${prefix}: env var ${destination.access_token_env} is not set`);
+    }
+    return;
+  }
+
   throw new Error(`${prefix}.network unsupported: ${destination.network}`);
 };
 
@@ -1138,6 +1159,33 @@ const markdownToPlainText = (md) => {
     .replace(/\\([\\`*_{}\[\]()#+\-.!|>~])/g, '$1');
 };
 
+/**
+ * Truncates text at a natural boundary.
+ * Priority: sentence end (. ! ?) → newline → word boundary → hard cut.
+ * Never cuts mid-word unless no boundary exists.
+ */
+const truncateText = (text, maxLen, ellipsis = '…') => {
+  if (!text || text.length <= maxLen) return text || '';
+  const limit = maxLen - ellipsis.length;
+  if (limit <= 0) return ellipsis.slice(0, maxLen);
+
+  const sentenceEnd = Math.max(
+    ...['. ', '.\n', '! ', '!\n', '? ', '?\n'].map((s) => {
+      const i = text.lastIndexOf(s, limit);
+      return i > 0 ? i + 1 : -1;
+    }),
+  );
+  if (sentenceEnd > limit * 0.4) return text.slice(0, sentenceEnd).trimEnd() + ellipsis;
+
+  const nlEnd = text.lastIndexOf('\n', limit);
+  if (nlEnd > limit * 0.4) return text.slice(0, nlEnd).trimEnd() + ellipsis;
+
+  const spaceEnd = text.lastIndexOf(' ', limit);
+  if (spaceEnd > limit * 0.2) return text.slice(0, spaceEnd) + ellipsis;
+
+  return text.slice(0, limit) + ellipsis;
+};
+
 const sendToFacebook = async (destination, text, telegramMessage) => {
   const accessToken = resolveFacebookAccessToken(destination);
   const pageId = destination.page_id;
@@ -1265,6 +1313,280 @@ const sendToInstagram = async (destination, text, telegramMessage) => {
   return publishResp.json();
 };
 
+// ── YouTube destination ──────────────────────────────────────────────────────
+
+const YOUTUBE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const YOUTUBE_UPLOAD_URL = 'https://www.googleapis.com/upload/youtube/v3/videos';
+
+const resolveYouTubeConfig = (destination) => ({
+  clientId: process.env[destination.client_id_env || 'YOUTUBE_CLIENT_ID'],
+  clientSecret: process.env[destination.client_secret_env || 'YOUTUBE_CLIENT_SECRET'],
+  refreshToken: process.env[destination.refresh_token_env || 'YOUTUBE_REFRESH_TOKEN'],
+});
+
+const refreshYouTubeAccessToken = async ({ clientId, clientSecret, refreshToken }) => {
+  const resp = await fetch(YOUTUBE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`YouTube token refresh failed ${resp.status}: ${err.slice(0, 200)}`);
+  }
+  const { access_token: accessToken } = await resp.json();
+  return accessToken;
+};
+
+const isYouTubeShorts = (video, destination) => {
+  if (!video) return false;
+  const maxDuration = typeof destination.shorts_max_duration_s === 'number'
+    ? destination.shorts_max_duration_s : 60;
+  const isShort = typeof video.duration === 'number' && video.duration <= maxDuration;
+  const isVertical = destination.shorts_for_vertical !== false
+    && typeof video.width === 'number' && typeof video.height === 'number'
+    && video.height > video.width;
+  return isShort && isVertical;
+};
+
+const uploadToYouTube = async (accessToken, { title, description, categoryId, privacyStatus, filePath, mime }) => {
+  const fileBuffer = fs.readFileSync(filePath);
+  const contentType = mime || 'video/mp4';
+
+  const initResp = await fetch(
+    `${YOUTUBE_UPLOAD_URL}?uploadType=resumable&part=snippet,status`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': contentType,
+        'X-Upload-Content-Length': String(fileBuffer.length),
+      },
+      body: JSON.stringify({
+        snippet: {
+          title: truncateText(title || 'Video', 100, '…'),
+          description: truncateText(description || '', 5000, '…'),
+          categoryId: String(categoryId || 22),
+        },
+        status: { privacyStatus: privacyStatus || 'public' },
+      }),
+    },
+  );
+  if (!initResp.ok) {
+    const err = await initResp.text();
+    throw new Error(`YouTube upload init failed ${initResp.status}: ${err.slice(0, 300)}`);
+  }
+  const uploadUrl = initResp.headers.get('location');
+  if (!uploadUrl) throw new Error('YouTube: no Location header in upload init response');
+
+  const uploadResp = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': contentType, 'Content-Length': String(fileBuffer.length) },
+    body: fileBuffer,
+  });
+  if (!uploadResp.ok && uploadResp.status !== 201) {
+    const err = await uploadResp.text();
+    throw new Error(`YouTube upload failed ${uploadResp.status}: ${err.slice(0, 300)}`);
+  }
+  return uploadResp.json();
+};
+
+const sendToYouTube = async (destination, text, telegramMessage) => {
+  const video = telegramMessage?.video || telegramMessage?.animation;
+  if (!video) {
+    log('YouTube: skipping — message has no video', { network: 'youtube' });
+    return null;
+  }
+
+  const ytConfig = resolveYouTubeConfig(destination);
+  const accessToken = await refreshYouTubeAccessToken(ytConfig);
+  const location = await tgResolveFileLocation(video.file_id);
+
+  const plainText = markdownToPlainText(text);
+  const shorts = isYouTubeShorts(video, destination);
+  const shortsTag = shorts ? ' #Shorts' : '';
+  const firstLine = plainText ? plainText.split('\n')[0] : '';
+  const title = truncateText(firstLine || 'Video', 100 - shortsTag.length, '…') + shortsTag;
+  const description = shorts ? `#Shorts\n\n${plainText}` : plainText;
+
+  let tmpFile = null;
+  try {
+    const source = location.type === 'source'
+      ? location.value
+      : (tmpFile = await downloadUrlToTempFile(location.value, video.mime_type || 'video/mp4'));
+
+    const result = await uploadToYouTube(accessToken, {
+      title,
+      description,
+      categoryId: destination.category_id || 22,
+      privacyStatus: destination.privacy_status || 'public',
+      filePath: source,
+      mime: video.mime_type || 'video/mp4',
+    });
+
+    log('Posted to YouTube', { video_id: result.id, is_shorts: shorts });
+    return result;
+  } finally {
+    if (tmpFile) {
+      activeTempFiles.delete(tmpFile);
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    }
+  }
+};
+
+// ── VK destination ───────────────────────────────────────────────────────────
+
+const VK_API_BASE = 'https://api.vk.com/method';
+const VK_API_VERSION = '5.199';
+
+const resolveVkAccessToken = (destination) => {
+  if (typeof destination.access_token === 'string' && destination.access_token.length > 0) {
+    return destination.access_token;
+  }
+  const token = process.env[destination.access_token_env];
+  if (!token) throw new Error(`VK access token env var "${destination.access_token_env}" is not set`);
+  return token;
+};
+
+const vkApiCall = async (method, params) => {
+  const body = new URLSearchParams({ ...params, v: VK_API_VERSION });
+  const resp = await fetch(`${VK_API_BASE}/${method}`, { method: 'POST', body });
+  if (!resp.ok) throw new Error(`VK API HTTP ${resp.status} on ${method}`);
+  const data = await resp.json();
+  if (data.error) throw new Error(`VK API error ${data.error.error_code}: ${data.error.error_msg}`);
+  return data.response;
+};
+
+const isVkClip = (video, destination) => {
+  if (!video) return false;
+  const maxDuration = typeof destination.clips_max_duration_s === 'number'
+    ? destination.clips_max_duration_s : 60;
+  const isShort = typeof video.duration === 'number' && video.duration <= maxDuration;
+  const isVertical = destination.clips_for_vertical !== false
+    && typeof video.width === 'number' && typeof video.height === 'number'
+    && video.height > video.width;
+  return isShort && isVertical;
+};
+
+const uploadVideoToVk = async (accessToken, ownerId, { filePath, mime, title, description, isClip }) => {
+  const saveParams = {
+    access_token: accessToken,
+    owner_id: ownerId,
+    name: truncateText(title || 'Video', 255, '…'),
+    description: truncateText(description || '', 5000, '…'),
+  };
+  if (isClip) saveParams.is_reels = 1;
+
+  const saveResp = await vkApiCall('video.save', saveParams);
+  const { upload_url: uploadUrl, video_id: videoId, owner_id: videoOwnerId } = saveResp;
+
+  const fileBuffer = fs.readFileSync(filePath);
+  const formData = new FormData();
+  formData.append('video_file', new Blob([fileBuffer], { type: mime || 'video/mp4' }), 'video.mp4');
+
+  const uploadResp = await fetch(uploadUrl, { method: 'POST', body: formData });
+  if (!uploadResp.ok) {
+    const err = await uploadResp.text();
+    throw new Error(`VK video upload failed ${uploadResp.status}: ${err.slice(0, 200)}`);
+  }
+  return { videoId, videoOwnerId };
+};
+
+const uploadPhotoToVkWall = async (accessToken, ownerId, filePath) => {
+  const groupId = ownerId < 0 ? -ownerId : undefined;
+  const serverParams = { access_token: accessToken };
+  if (groupId) serverParams.group_id = groupId;
+
+  const server = await vkApiCall('photos.getWallUploadServer', serverParams);
+
+  const fileBuffer = fs.readFileSync(filePath);
+  const formData = new FormData();
+  formData.append('photo', new Blob([fileBuffer], { type: 'image/jpeg' }), 'photo.jpg');
+
+  const uploadResp = await fetch(server.upload_url, { method: 'POST', body: formData });
+  if (!uploadResp.ok) throw new Error(`VK photo upload HTTP ${uploadResp.status}`);
+  const uploadData = await uploadResp.json();
+
+  const saveParams = {
+    access_token: accessToken,
+    server: uploadData.server,
+    photo: uploadData.photo,
+    hash: uploadData.hash,
+  };
+  if (groupId) saveParams.group_id = groupId;
+
+  const saved = await vkApiCall('photos.saveWallPhoto', saveParams);
+  const photo = saved[0];
+  return { photoId: photo.id, photoOwnerId: photo.owner_id };
+};
+
+const sendToVk = async (destination, text, telegramMessage) => {
+  const accessToken = resolveVkAccessToken(destination);
+  const ownerId = destination.owner_id;
+  const plainText = markdownToPlainText(text);
+
+  const video = telegramMessage?.video || telegramMessage?.animation;
+  const hasPhoto = telegramMessage && Array.isArray(telegramMessage.photo) && telegramMessage.photo.length > 0;
+
+  let attachment = '';
+  let tmpFile = null;
+
+  try {
+    if (video) {
+      const location = await tgResolveFileLocation(video.file_id);
+      const source = location.type === 'source'
+        ? location.value
+        : (tmpFile = await downloadUrlToTempFile(location.value, video.mime_type || 'video/mp4'));
+
+      const clip = isVkClip(video, destination);
+      const firstLine = plainText ? plainText.split('\n')[0] : '';
+      const { videoId, videoOwnerId } = await uploadVideoToVk(accessToken, ownerId, {
+        filePath: source,
+        mime: video.mime_type,
+        title: firstLine || 'Video',
+        description: plainText || '',
+        isClip: clip,
+      });
+      attachment = `video${videoOwnerId}_${videoId}`;
+      log('VK video uploaded', { owner_id: videoOwnerId, video_id: videoId, is_clip: clip });
+
+    } else if (hasPhoto) {
+      const bestPhoto = telegramMessage.photo[telegramMessage.photo.length - 1];
+      const location = await tgResolveFileLocation(bestPhoto.file_id);
+      const source = location.type === 'source'
+        ? location.value
+        : (tmpFile = await downloadUrlToTempFile(location.value, 'image/jpeg'));
+
+      const { photoId, photoOwnerId } = await uploadPhotoToVkWall(accessToken, ownerId, source);
+      attachment = `photo${photoOwnerId}_${photoId}`;
+      log('VK photo uploaded', { owner_id: photoOwnerId, photo_id: photoId });
+    }
+
+    const postParams = {
+      access_token: accessToken,
+      owner_id: ownerId,
+      message: plainText || '',
+      from_group: ownerId < 0 ? 1 : 0,
+    };
+    if (attachment) postParams.attachments = attachment;
+
+    const postResult = await vkApiCall('wall.post', postParams);
+    log('Posted to VK', { owner_id: ownerId, post_id: postResult.post_id });
+    return postResult;
+  } finally {
+    if (tmpFile) {
+      activeTempFiles.delete(tmpFile);
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    }
+  }
+};
+
 const sendToDestination = async (destination, text, attachments, meta = {}) => {
   if (destination.network === 'max') {
     const payload = { format: 'markdown' };
@@ -1288,6 +1610,14 @@ const sendToDestination = async (destination, text, attachments, meta = {}) => {
 
   if (destination.network === 'instagram') {
     return sendToInstagram(destination, text, meta.telegramMessage || null);
+  }
+
+  if (destination.network === 'youtube') {
+    return sendToYouTube(destination, text, meta.telegramMessage || null);
+  }
+
+  if (destination.network === 'vk') {
+    return sendToVk(destination, text, meta.telegramMessage || null);
   }
 
   throw new Error(`Unsupported destination network: ${destination.network}`);

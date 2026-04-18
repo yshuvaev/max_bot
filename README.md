@@ -15,6 +15,9 @@ A lightweight Node.js bridge that automatically reposts messages from **Telegram
 - **Media albums** — Telegram `media_group` arrives as a single MAX message with multiple attachments
 - **Facebook destination** — post text and photos to a Facebook Page via Graph API ([setup guide](docs/facebook.md))
 - **Instagram destination** — post photos and Reels to an Instagram Business/Creator account ([setup guide](docs/instagram.md))
+- **YouTube destination** — upload videos to YouTube; vertical videos ≤60 s auto-published as Shorts ([setup guide](docs/youtube.md))
+- **VK destination** — post text/photos/video to VK community or profile wall; vertical videos ≤60 s auto-uploaded as VK Clips ([setup guide](docs/vk.md))
+- **Smart text truncation** — titles/descriptions cut at sentence → newline → word boundary (never mid-word)
 - **Source footer** — optional "tg: [Channel](link)" footer on every reposted message
 - **Sender name** — optional bold sender name prefix for group-to-group bridges
 - **Multiple routes** — fan-out from one source to many destinations, or many independent routes
@@ -395,12 +398,14 @@ state is kept and the CLI returns a non-zero exit code.
 
 The bridge supports posting to **Facebook Pages** and **Instagram** Business/Creator accounts as destinations alongside MAX and Telegram.
 
-| Destination | Config field | Supported content | Setup guide |
-|---|---|---|---|
-| Facebook Page | `"network": "facebook"` | Text, photos | [docs/facebook.md](docs/facebook.md) |
-| Instagram Business | `"network": "instagram"` | Photos, Reels (video) | [docs/instagram.md](docs/instagram.md) |
+| Destination | Config field | Supported content | Shorts/Clips auto-detect | Setup guide |
+|---|---|---|---|---|
+| Facebook Page | `"network": "facebook"` | Text, photos | — | [docs/facebook.md](docs/facebook.md) |
+| Instagram Business | `"network": "instagram"` | Photos, Reels (video) | — | [docs/instagram.md](docs/instagram.md) |
+| YouTube Channel | `"network": "youtube"` | Video → auto Shorts | vertical + ≤60 s | [docs/youtube.md](docs/youtube.md) |
+| VK Community / Profile | `"network": "vk"` | Text, photos, video → auto Clips | vertical + ≤60 s | [docs/vk.md](docs/vk.md) |
 
-**Quick example — fan-out from Telegram to MAX + Facebook + Instagram:**
+**Quick example — fan-out from Telegram to all platforms:**
 
 ```jsonc
 {
@@ -409,12 +414,15 @@ The bridge supports posting to **Facebook Pages** and **Instagram** Business/Cre
   "destinations": [
     { "network": "max", "chat_id": -70999000000000 },
     { "network": "facebook", "page_id": "123456789012345", "access_token_env": "FB_PAGE_ACCESS_TOKEN" },
-    { "network": "instagram", "ig_user_id": "17841234567890123", "access_token_env": "FB_PAGE_ACCESS_TOKEN" }
+    { "network": "instagram", "ig_user_id": "17841234567890123", "access_token_env": "FB_PAGE_ACCESS_TOKEN" },
+    { "network": "youtube", "privacy_status": "public", "shorts_for_vertical": true },
+    { "network": "vk", "owner_id": -123456789, "access_token_env": "VK_ACCESS_TOKEN" }
   ]
 }
 ```
 
-Both Facebook and Instagram use a **Page Access Token** from the Meta developer portal.
+Facebook and Instagram share one **Page Access Token** from the Meta developer portal.
+YouTube requires OAuth 2.0 (refresh token). VK uses a community or user access token.
 See the respective setup guides for step-by-step instructions.
 
 ---
