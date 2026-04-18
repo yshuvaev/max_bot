@@ -12,7 +12,8 @@
     "bridge:pair": "node scripts/bridge-init.js --add-pair",
     "bridge:cli": "node ./bin/max-bot-bridge.js",
     "start": "node src/index.js",
-    "userbot:auth": "node scripts/userbot-auth.js"
+    "userbot:auth": "node scripts/userbot-auth.js",
+    "tiktok:auth": "node scripts/tiktok-auth.js"
   },
   "engines": {
     "node": ">=18.18.0"

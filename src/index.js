@@ -152,6 +152,26 @@ const validateDestination = (routeId, destination, index) => {
     return;
   }
 
+  if (destination.network === 'tiktok') {
+    const clientKeyEnv = destination.client_key_env || 'TIKTOK_CLIENT_KEY';
+    const clientSecretEnv = destination.client_secret_env || 'TIKTOK_CLIENT_SECRET';
+    const stored = loadTikTokTokens();
+    const refreshTokenEnv = destination.refresh_token_env || 'TIKTOK_REFRESH_TOKEN';
+    assert(
+      process.env[clientKeyEnv],
+      `${prefix}: env var ${clientKeyEnv} is not set (TikTok client_key)`,
+    );
+    assert(
+      process.env[clientSecretEnv],
+      `${prefix}: env var ${clientSecretEnv} is not set (TikTok client_secret)`,
+    );
+    assert(
+      stored?.refresh_token || process.env[refreshTokenEnv],
+      `${prefix}: TikTok refresh_token not found. Run: npm run tiktok:auth`,
+    );
+    return;
+  }
+
   if (destination.network === 'vk') {
     ensureNumber(destination.owner_id, `${prefix}.owner_id`);
     const hasInline = typeof destination.access_token === 'string' && destination.access_token.length > 0;
@@ -1738,6 +1758,209 @@ const sendToVk = async (destination, text, telegramMessage) => {
   }
 };
 
+// ── TikTok destination ───────────────────────────────────────────────────────
+
+const TIKTOK_API_BASE = 'https://open.tiktokapis.com/v2';
+const TIKTOK_TOKENS_FILE = path.resolve(process.cwd(), '.tiktok_tokens.json');
+
+const loadTikTokTokens = () => {
+  try {
+    if (fs.existsSync(TIKTOK_TOKENS_FILE)) {
+      return JSON.parse(fs.readFileSync(TIKTOK_TOKENS_FILE, 'utf8'));
+    }
+  } catch { /* ignore */ }
+  return null;
+};
+
+const saveTikTokTokens = (tokens) => {
+  try {
+    fs.writeFileSync(TIKTOK_TOKENS_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+  } catch (err) {
+    log('TikTok: failed to save tokens file', { error: err instanceof Error ? err.message : String(err) });
+  }
+};
+
+const resolveTikTokConfig = (destination) => {
+  const stored = loadTikTokTokens();
+  return {
+    clientKey: process.env[destination.client_key_env || 'TIKTOK_CLIENT_KEY'],
+    clientSecret: process.env[destination.client_secret_env || 'TIKTOK_CLIENT_SECRET'],
+    refreshToken: stored?.refresh_token || process.env[destination.refresh_token_env || 'TIKTOK_REFRESH_TOKEN'],
+  };
+};
+
+const refreshTikTokAccessToken = async ({ clientKey, clientSecret, refreshToken }) => {
+  const resp = await fetch(`${TIKTOK_API_BASE}/oauth/token/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_key: clientKey,
+      client_secret: clientSecret,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+    }),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`TikTok token refresh failed ${resp.status}: ${err.slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  if (data.error?.code && data.error.code !== 'ok') {
+    throw new Error(`TikTok token error: ${data.error.message} (${data.error.code})`);
+  }
+  const tokens = {
+    access_token: data.data.access_token,
+    refresh_token: data.data.refresh_token,
+    expires_in: data.data.expires_in,
+    refresh_expires_in: data.data.refresh_expires_in,
+    saved_at: Date.now(),
+  };
+  saveTikTokTokens(tokens);
+  return tokens.access_token;
+};
+
+const pollTikTokPublish = async (accessToken, publishId, maxWaitMs = 120000) => {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    await sleep(5000);
+    const resp = await fetch(`${TIKTOK_API_BASE}/post/publish/status/fetch/`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+      },
+      body: JSON.stringify({ publish_id: publishId }),
+    });
+    if (!resp.ok) continue;
+    const data = await resp.json();
+    const status = data.data?.status;
+    if (status === 'PUBLISH_COMPLETE') return;
+    if (status === 'FAILED') {
+      throw new Error(`TikTok publish failed: ${data.data?.fail_reason || 'unknown reason'}`);
+    }
+  }
+  throw new Error('TikTok publish timeout (120s)');
+};
+
+const sendToTikTok = async (destination, text, telegramMessage) => {
+  const isStory = destination.post_type === 'story';
+  const hasVideo = telegramMessage && (telegramMessage.video || telegramMessage.animation);
+  const hasPhoto = telegramMessage && Array.isArray(telegramMessage.photo) && telegramMessage.photo.length > 0;
+
+  if (!hasVideo && !hasPhoto) {
+    log('TikTok: skipping — no video or photo', { post_type: destination.post_type || 'video' });
+    return null;
+  }
+  if (!isStory && !hasVideo) {
+    log('TikTok: skipping — feed video post requires a video (text/photo-only not supported)');
+    return null;
+  }
+
+  const ttConfig = resolveTikTokConfig(destination);
+  const accessToken = await refreshTikTokAccessToken(ttConfig);
+  const plainText = markdownToPlainText(text);
+
+  // Stories: photo or video via content/init
+  if (isStory) {
+    const privacyLevel = destination.privacy_level || 'PUBLIC_TO_EVERYONE';
+
+    if (hasPhoto && !hasVideo) {
+      const bestPhoto = telegramMessage.photo[telegramMessage.photo.length - 1];
+      const location = await tgResolveFileLocation(bestPhoto.file_id);
+      if (location.type !== 'url') throw new Error('TikTok: photo must be accessible via public URL');
+
+      const body = {
+        post_info: {
+          title: truncateText(plainText || '', 150, '…'),
+          privacy_level: privacyLevel,
+        },
+        source_info: {
+          source: 'PULL_FROM_URL',
+          photo_images: [location.value],
+          photo_cover_index: 0,
+        },
+        post_mode: 'DIRECT_POST',
+        media_type: 'PHOTO',
+      };
+
+      const resp = await fetch(`${TIKTOK_API_BASE}/post/publish/content/init/`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json; charset=UTF-8' },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error(`TikTok story (photo) init failed ${resp.status}: ${err.slice(0, 300)}`);
+      }
+      const result = await resp.json();
+      log('Posted to TikTok story (photo)', { publish_id: result.data?.publish_id });
+      return result;
+    }
+
+    // Video story — use same video endpoint with story intent header
+    const srcVideo = telegramMessage.video || telegramMessage.animation;
+    const location = await tgResolveFileLocation(srcVideo.file_id);
+    if (location.type !== 'url') throw new Error('TikTok: video must be accessible via public URL');
+
+    const body = {
+      post_info: {
+        title: truncateText(plainText || '', 150, '…'),
+        privacy_level: privacyLevel,
+        disable_duet: true,
+        disable_stitch: true,
+        disable_comment: destination.disable_comment || false,
+        video_cover_timestamp_ms: 0,
+      },
+      source_info: { source: 'PULL_FROM_URL', video_url: location.value },
+    };
+
+    const resp = await fetch(`${TIKTOK_API_BASE}/post/publish/video/init/`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json; charset=UTF-8', 'X-TT-Post-Type': 'story' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`TikTok story (video) init failed ${resp.status}: ${err.slice(0, 300)}`);
+    }
+    const result = await resp.json();
+    if (result.data?.publish_id) await pollTikTokPublish(accessToken, result.data.publish_id);
+    log('Posted to TikTok story (video)', { publish_id: result.data?.publish_id });
+    return result;
+  }
+
+  // Feed video post
+  const srcVideo = telegramMessage.video || telegramMessage.animation;
+  const location = await tgResolveFileLocation(srcVideo.file_id);
+  if (location.type !== 'url') throw new Error('TikTok: video must be accessible via public URL');
+
+  const body = {
+    post_info: {
+      title: truncateText(plainText || '', 150, '…'),
+      privacy_level: destination.privacy_level || 'PUBLIC_TO_EVERYONE',
+      disable_duet: destination.disable_duet || false,
+      disable_comment: destination.disable_comment || false,
+      disable_stitch: destination.disable_stitch || false,
+      video_cover_timestamp_ms: 0,
+    },
+    source_info: { source: 'PULL_FROM_URL', video_url: location.value },
+  };
+
+  const resp = await fetch(`${TIKTOK_API_BASE}/post/publish/video/init/`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json; charset=UTF-8' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`TikTok video init failed ${resp.status}: ${err.slice(0, 300)}`);
+  }
+  const result = await resp.json();
+  if (result.data?.publish_id) await pollTikTokPublish(accessToken, result.data.publish_id);
+  log('Posted to TikTok feed (video)', { publish_id: result.data?.publish_id });
+  return result;
+};
+
 const sendToDestination = async (destination, text, attachments, meta = {}) => {
   if (destination.network === 'max') {
     const payload = { format: 'markdown' };
@@ -1773,6 +1996,10 @@ const sendToDestination = async (destination, text, attachments, meta = {}) => {
 
   if (destination.network === 'vk') {
     return sendToVk(destination, text, meta.telegramMessage || null);
+  }
+
+  if (destination.network === 'tiktok') {
+    return sendToTikTok(destination, text, meta.telegramMessage || null);
   }
 
   throw new Error(`Unsupported destination network: ${destination.network}`);

@@ -18,6 +18,7 @@ A lightweight Node.js bridge that automatically reposts messages from **Telegram
 - **YouTube destination** — upload videos to YouTube; vertical videos ≤60 s auto-published as Shorts ([setup guide](docs/youtube.md))
 - **VK destination** — post text/photos/video to VK community or profile wall; vertical videos ≤60 s auto-uploaded as VK Clips ([setup guide](docs/vk.md))
 - **Telegram Stories destination** — post stories to Telegram channels via userbot (MTProto); one-time phone auth, no new app registration ([setup guide](docs/telegram-stories.md))
+- **TikTok destination** — publish videos to TikTok feed and stories; `post_type: "video"` or `"story"`; tokens auto-rotated in `.tiktok_tokens.json` ([setup guide](docs/tiktok.md))
 - **Smart text truncation** — titles/descriptions cut at sentence → newline → word boundary (never mid-word)
 - **Source footer** — optional "tg: [Channel](link)" footer on every reposted message
 - **Sender name** — optional bold sender name prefix for group-to-group bridges
@@ -406,6 +407,7 @@ The bridge supports posting to **Facebook Pages** and **Instagram** Business/Cre
 | YouTube Channel | `"network": "youtube"` | Video → auto Shorts | vertical + ≤60 s | [docs/youtube.md](docs/youtube.md) |
 | VK Community / Profile | `"network": "vk"` | Text, photos, video → auto Clips | vertical + ≤60 s | [docs/vk.md](docs/vk.md) |
 | Telegram Stories | `"network": "telegram_stories"` | Photos, videos | — | [docs/telegram-stories.md](docs/telegram-stories.md) |
+| TikTok | `"network": "tiktok"` | Video (feed), photo/video (story) | — | [docs/tiktok.md](docs/tiktok.md) |
 
 **Quick example — fan-out from Telegram to all platforms:**
 
