@@ -109,6 +109,17 @@ const validateDestination = (routeId, destination, index) => {
     return;
   }
 
+  if (destination.network === 'facebook') {
+    ensureString(destination.page_id, `${prefix}.page_id`);
+    const hasInline = typeof destination.access_token === 'string' && destination.access_token.length > 0;
+    const hasEnv = typeof destination.access_token_env === 'string' && destination.access_token_env.length > 0;
+    assert(hasInline || hasEnv, `${prefix}: set access_token (inline) or access_token_env (env var name) for facebook destination`);
+    if (hasEnv) {
+      assert(process.env[destination.access_token_env], `${prefix}: env var ${destination.access_token_env} is not set`);
+    }
+    return;
+  }
+
   throw new Error(`${prefix}.network unsupported: ${destination.network}`);
 };
 
@@ -1092,7 +1103,75 @@ const findApiRoutes = (apiKey) => {
   });
 };
 
-const sendToDestination = async (destination, text, attachments) => {
+const FB_API_BASE = 'https://graph.facebook.com/v21.0';
+
+const resolveFacebookAccessToken = (destination) => {
+  if (typeof destination.access_token === 'string' && destination.access_token.length > 0) {
+    return destination.access_token;
+  }
+  const token = process.env[destination.access_token_env];
+  if (!token) throw new Error(`Facebook access token env var "${destination.access_token_env}" is not set`);
+  return token;
+};
+
+const markdownToPlainText = (md) => {
+  if (!md) return '';
+  return md
+    .replace(/\n?```[\s\S]*?```\n?/g, (m) => m.replace(/```\w*/g, '').trim())
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/(?<!\w)_(.+?)_(?!\w)/g, '$1')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/\+\+(.+?)\+\+/g, '$1')
+    .replace(/\\([\\`*_{}\[\]()#+\-.!|>~])/g, '$1');
+};
+
+const sendToFacebook = async (destination, text, telegramMessage) => {
+  const accessToken = resolveFacebookAccessToken(destination);
+  const pageId = destination.page_id;
+  const plainText = markdownToPlainText(text);
+
+  // Attempt photo post if the message has a photo
+  if (telegramMessage && Array.isArray(telegramMessage.photo) && telegramMessage.photo.length > 0) {
+    try {
+      const bestPhoto = telegramMessage.photo[telegramMessage.photo.length - 1];
+      const location = await tgResolveFileLocation(bestPhoto.file_id);
+      if (location.type === 'url') {
+        const params = new URLSearchParams({
+          url: location.value,
+          caption: plainText || '',
+          access_token: accessToken,
+        });
+        const photoResp = await fetch(`${FB_API_BASE}/${pageId}/photos`, {
+          method: 'POST',
+          body: params,
+        });
+        if (photoResp.ok) return photoResp.json();
+        const errBody = await photoResp.text();
+        log('Facebook photo post failed, falling back to text', { status: photoResp.status, error: errBody.slice(0, 200) });
+      }
+    } catch (err) {
+      log('Facebook photo post error, falling back to text', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  const params = new URLSearchParams({
+    message: plainText || ' ',
+    access_token: accessToken,
+  });
+  const response = await fetch(`${FB_API_BASE}/${pageId}/feed`, {
+    method: 'POST',
+    body: params,
+  });
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Facebook API error ${response.status}: ${errBody.slice(0, 300)}`);
+  }
+  return response.json();
+};
+
+const sendToDestination = async (destination, text, attachments, meta = {}) => {
   if (destination.network === 'max') {
     const payload = { format: 'markdown' };
     if (attachments && attachments.length) payload.attachments = attachments;
@@ -1109,12 +1188,16 @@ const sendToDestination = async (destination, text, attachments) => {
     return telegram.sendMessage(destination.chat_id, safeText, { parse_mode: 'HTML' });
   }
 
+  if (destination.network === 'facebook') {
+    return sendToFacebook(destination, text, meta.telegramMessage || null);
+  }
+
   throw new Error(`Unsupported destination network: ${destination.network}`);
 };
 
-const sendToRouteDestinations = async (route, text, attachments) => {
+const sendToRouteDestinations = async (route, text, attachments, meta = {}) => {
   for (const destination of route.destinations) {
-    await sendToDestination(destination, text, attachments);
+    await sendToDestination(destination, text, attachments, meta);
   }
 };
 
@@ -1183,7 +1266,7 @@ const forwardTelegramSingle = async (route, message) => {
   const { attachments, warningText } = await buildAttachmentsFromTelegram(message);
   const text = getTelegramMessageText(message, route, warningText);
 
-  await sendToRouteDestinations(route, text, attachments);
+  await sendToRouteDestinations(route, text, attachments, { telegramMessage: message });
 
   log('Reposted telegram message', {
     route_id: route.id,
@@ -1209,7 +1292,7 @@ const forwardTelegramGroup = async (route, messages) => {
   const warningText = warningSet.size ? Array.from(warningSet).join('\n') : '';
   const text = getTelegramMessageText(anchor, route, warningText);
 
-  await sendToRouteDestinations(route, text, attachments);
+  await sendToRouteDestinations(route, text, attachments, { telegramMessage: anchor });
 
   log('Reposted telegram media_group', {
     route_id: route.id,
