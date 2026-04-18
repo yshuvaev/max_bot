@@ -1,18 +1,20 @@
-# Telegram / API → MAX Bridge Bot
+# Telegram / API → MAX / Facebook / Instagram Bridge Bot
 
 **[Русский](README.ru.md)** | English
 
-A lightweight Node.js bridge that automatically reposts messages from **Telegram** channels/groups and **external API sources** to **MAX** (max.ru) and **Telegram** channels, including text formatting, images, videos, audio, and file attachments.
+A lightweight Node.js bridge that automatically reposts messages from **Telegram** channels/groups and **external API sources** to **MAX** (max.ru), **Telegram**, **Facebook Pages**, and **Instagram** business accounts, including text formatting, images, videos, audio, and file attachments.
 
 ---
 
 ## Features
 
 - **Text** — Telegram markdown entities (bold, italic, links, code, …) converted to MAX markdown
-- **Images** — forwarded via MAX upload API
-- **Video / Audio / Files** — downloaded from Telegram and uploaded to MAX
+- **Images** — forwarded via MAX upload API; also posted as photos to Facebook / Instagram
+- **Video / Audio / Files** — downloaded from Telegram and uploaded to MAX; videos forwarded to Instagram as Reels
 - **Large videos (> 20 MB)** — downloaded via MTProto (requires optional `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`)
 - **Media albums** — Telegram `media_group` arrives as a single MAX message with multiple attachments
+- **Facebook destination** — post text and photos to a Facebook Page via Graph API ([setup guide](docs/facebook.md))
+- **Instagram destination** — post photos and Reels to an Instagram Business/Creator account ([setup guide](docs/instagram.md))
 - **Source footer** — optional "tg: [Channel](link)" footer on every reposted message
 - **Sender name** — optional bold sender name prefix for group-to-group bridges
 - **Multiple routes** — fan-out from one source to many destinations, or many independent routes
@@ -386,6 +388,34 @@ max-bot-bridge backup delete  routes-20260411-143022-add_my_route.json --force
 Restoring a snapshot goes through the same validation pipeline as any
 other mutation — if the restored file fails validation the previous
 state is kept and the CLI returns a non-zero exit code.
+
+---
+
+## Social media destinations
+
+The bridge supports posting to **Facebook Pages** and **Instagram** Business/Creator accounts as destinations alongside MAX and Telegram.
+
+| Destination | Config field | Supported content | Setup guide |
+|---|---|---|---|
+| Facebook Page | `"network": "facebook"` | Text, photos | [docs/facebook.md](docs/facebook.md) |
+| Instagram Business | `"network": "instagram"` | Photos, Reels (video) | [docs/instagram.md](docs/instagram.md) |
+
+**Quick example — fan-out from Telegram to MAX + Facebook + Instagram:**
+
+```jsonc
+{
+  "id": "tg_to_all",
+  "source": { "network": "telegram", "chat_id": -1001234567890 },
+  "destinations": [
+    { "network": "max", "chat_id": -70999000000000 },
+    { "network": "facebook", "page_id": "123456789012345", "access_token_env": "FB_PAGE_ACCESS_TOKEN" },
+    { "network": "instagram", "ig_user_id": "17841234567890123", "access_token_env": "FB_PAGE_ACCESS_TOKEN" }
+  ]
+}
+```
+
+Both Facebook and Instagram use a **Page Access Token** from the Meta developer portal.
+See the respective setup guides for step-by-step instructions.
 
 ---
 

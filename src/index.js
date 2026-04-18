@@ -120,6 +120,17 @@ const validateDestination = (routeId, destination, index) => {
     return;
   }
 
+  if (destination.network === 'instagram') {
+    ensureString(destination.ig_user_id, `${prefix}.ig_user_id`);
+    const hasInline = typeof destination.access_token === 'string' && destination.access_token.length > 0;
+    const hasEnv = typeof destination.access_token_env === 'string' && destination.access_token_env.length > 0;
+    assert(hasInline || hasEnv, `${prefix}: set access_token (inline) or access_token_env (env var name) for instagram destination`);
+    if (hasEnv) {
+      assert(process.env[destination.access_token_env], `${prefix}: env var ${destination.access_token_env} is not set`);
+    }
+    return;
+  }
+
   throw new Error(`${prefix}.network unsupported: ${destination.network}`);
 };
 
@@ -1171,6 +1182,89 @@ const sendToFacebook = async (destination, text, telegramMessage) => {
   return response.json();
 };
 
+const waitForInstagramMedia = async (creationId, accessToken, maxWaitMs = 90000) => {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    await sleep(4000);
+    const resp = await fetch(
+      `${FB_API_BASE}/${creationId}?fields=status_code&access_token=${encodeURIComponent(accessToken)}`,
+    );
+    if (!resp.ok) continue;
+    const { status_code: statusCode } = await resp.json();
+    if (statusCode === 'FINISHED') return;
+    if (statusCode === 'ERROR') throw new Error('Instagram media processing failed');
+  }
+  throw new Error('Instagram media processing timeout (90s)');
+};
+
+const sendToInstagram = async (destination, text, telegramMessage) => {
+  const accessToken = resolveFacebookAccessToken(destination);
+  const igUserId = destination.ig_user_id;
+  const plainText = markdownToPlainText(text);
+
+  const hasPhoto = telegramMessage && Array.isArray(telegramMessage.photo) && telegramMessage.photo.length > 0;
+  const hasVideo = telegramMessage && (telegramMessage.video || telegramMessage.animation);
+
+  if (!hasPhoto && !hasVideo) {
+    log('Instagram: skipping — feed requires media (text-only not supported)', {
+      ig_user_id: igUserId,
+    });
+    return null;
+  }
+
+  let mediaType;
+  let mediaUrl;
+
+  if (hasPhoto) {
+    const bestPhoto = telegramMessage.photo[telegramMessage.photo.length - 1];
+    const location = await tgResolveFileLocation(bestPhoto.file_id);
+    if (location.type !== 'url') throw new Error('Instagram: photo must be publicly accessible via URL (local file unsupported)');
+    mediaType = 'IMAGE';
+    mediaUrl = location.value;
+  } else {
+    const fileId = (telegramMessage.video || telegramMessage.animation).file_id;
+    const location = await tgResolveFileLocation(fileId);
+    if (location.type !== 'url') throw new Error('Instagram: video must be publicly accessible via URL (local file unsupported)');
+    mediaType = 'REELS';
+    mediaUrl = location.value;
+  }
+
+  const createParams = new URLSearchParams({ caption: plainText || '', access_token: accessToken });
+  if (mediaType === 'IMAGE') {
+    createParams.set('image_url', mediaUrl);
+  } else {
+    createParams.set('media_type', 'REELS');
+    createParams.set('video_url', mediaUrl);
+  }
+
+  const createResp = await fetch(`${FB_API_BASE}/${igUserId}/media`, {
+    method: 'POST',
+    body: createParams,
+  });
+  if (!createResp.ok) {
+    const errBody = await createResp.text();
+    throw new Error(`Instagram create media error ${createResp.status}: ${errBody.slice(0, 300)}`);
+  }
+  const { id: creationId } = await createResp.json();
+
+  if (mediaType === 'REELS') {
+    await waitForInstagramMedia(creationId, accessToken);
+  }
+
+  const publishParams = new URLSearchParams({ creation_id: creationId, access_token: accessToken });
+  const publishResp = await fetch(`${FB_API_BASE}/${igUserId}/media_publish`, {
+    method: 'POST',
+    body: publishParams,
+  });
+  if (!publishResp.ok) {
+    const errBody = await publishResp.text();
+    throw new Error(`Instagram publish error ${publishResp.status}: ${errBody.slice(0, 300)}`);
+  }
+
+  log('Posted to Instagram', { ig_user_id: igUserId, media_type: mediaType });
+  return publishResp.json();
+};
+
 const sendToDestination = async (destination, text, attachments, meta = {}) => {
   if (destination.network === 'max') {
     const payload = { format: 'markdown' };
@@ -1190,6 +1284,10 @@ const sendToDestination = async (destination, text, attachments, meta = {}) => {
 
   if (destination.network === 'facebook') {
     return sendToFacebook(destination, text, meta.telegramMessage || null);
+  }
+
+  if (destination.network === 'instagram') {
+    return sendToInstagram(destination, text, meta.telegramMessage || null);
   }
 
   throw new Error(`Unsupported destination network: ${destination.network}`);
