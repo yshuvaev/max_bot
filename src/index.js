@@ -15,9 +15,13 @@ const { createAdminHandler } = require('./admin/http');
 
 let GramjsClient = null;
 let GramjsStringSession = null;
+let GramjsApi = null;
+let GramjsCustomFile = null;
 try {
   GramjsClient = require('telegram').TelegramClient;
   GramjsStringSession = require('telegram/sessions').StringSession;
+  GramjsApi = require('telegram').Api;
+  GramjsCustomFile = require('telegram/client/uploads').CustomFile;
 } catch {
   // gramjs not installed — MTProto large-video support disabled
 }
@@ -128,6 +132,13 @@ const validateDestination = (routeId, destination, index) => {
     if (hasEnv) {
       assert(process.env[destination.access_token_env], `${prefix}: env var ${destination.access_token_env} is not set`);
     }
+    return;
+  }
+
+  if (destination.network === 'telegram_stories') {
+    const hasId = typeof destination.chat_id === 'number';
+    const hasUsername = typeof destination.chat_username === 'string' && destination.chat_username.trim().length > 0;
+    assert(hasId || hasUsername, `${prefix}: set chat_id and/or chat_username for telegram_stories destination`);
     return;
   }
 
@@ -354,6 +365,7 @@ const state = {
 };
 
 let mtprotoClient = null;
+let userbotClient = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -823,6 +835,145 @@ const initMtprotoClient = async () => {
   log('MTProto client ready', { seeded_entities: seeded });
 
   mtprotoClient = client;
+};
+
+// ── Userbot (MTProto user session) — Telegram Stories destination ────────────
+
+const initUserbotClient = async () => {
+  if (!GramjsClient || !GramjsStringSession || !GramjsApi || !GramjsCustomFile) return;
+
+  const apiId = Number.parseInt(process.env.TELEGRAM_API_ID || '0', 10);
+  const apiHash = process.env.TELEGRAM_API_HASH || '';
+  if (!apiId || !apiHash) return;
+
+  const sessionFile = path.resolve(
+    process.cwd(),
+    process.env.USERBOT_SESSION_FILE || '.userbot_session',
+  );
+
+  if (!fs.existsSync(sessionFile)) {
+    const hasStoriesRoutes = routingConfig.routes.some((r) =>
+      r.destinations.some((d) => d.network === 'telegram_stories'),
+    );
+    if (hasStoriesRoutes) {
+      log('telegram_stories destination configured but userbot session not found', {
+        hint: 'Run: npm run userbot:auth',
+        path: sessionFile,
+      });
+    }
+    return;
+  }
+
+  const sessionString = fs.readFileSync(sessionFile, 'utf8').trim();
+  const client = new GramjsClient(
+    new GramjsStringSession(sessionString),
+    apiId,
+    apiHash,
+    { connectionRetries: 3, retryDelay: 1000 },
+  );
+
+  await client.connect();
+
+  if (!await client.isUserAuthorized()) {
+    log('Userbot session invalid — re-run: npm run userbot:auth', { path: sessionFile });
+    return;
+  }
+
+  const me = await client.getMe();
+  log('Userbot client connected', { user: me.username || String(me.phone), id: String(me.id) });
+  userbotClient = client;
+};
+
+const sendToTelegramStories = async (destination, text, telegramMessage) => {
+  if (!userbotClient) {
+    throw new Error(
+      'Telegram Stories: userbot not initialized. Run: npm run userbot:auth, then restart the bridge.',
+    );
+  }
+
+  const hasPhoto = telegramMessage && Array.isArray(telegramMessage.photo) && telegramMessage.photo.length > 0;
+  const hasVideo = telegramMessage && (telegramMessage.video || telegramMessage.animation);
+
+  if (!hasPhoto && !hasVideo) {
+    log('Telegram Stories: skipping — stories require media (text-only not supported)', {
+      channel: destination.chat_username || destination.chat_id,
+    });
+    return null;
+  }
+
+  const caption = truncateText(markdownToPlainText(text) || '', 1000, '…');
+
+  let peer;
+  try {
+    peer = await userbotClient.getInputEntity(destination.chat_username || destination.chat_id);
+  } catch (err) {
+    throw new Error(
+      `Telegram Stories: cannot resolve peer ${destination.chat_username || destination.chat_id}: `
+      + `${err instanceof Error ? err.message : String(err)}. `
+      + 'Ensure the userbot account is added to the channel.',
+    );
+  }
+
+  let tmpFile = null;
+  try {
+    let media;
+
+    if (hasPhoto) {
+      const bestPhoto = telegramMessage.photo[telegramMessage.photo.length - 1];
+      const location = await tgResolveFileLocation(bestPhoto.file_id);
+      const filePath = location.type === 'source'
+        ? location.value
+        : (tmpFile = await downloadUrlToTempFile(location.value, 'image/jpeg'));
+
+      const fileSize = fs.statSync(filePath).size;
+      const uploaded = await userbotClient.uploadFile({
+        file: new GramjsCustomFile(path.basename(filePath), fileSize, filePath),
+        workers: 2,
+      });
+      media = new GramjsApi.InputMediaUploadedPhoto({ file: uploaded });
+
+    } else {
+      const srcVideo = telegramMessage.video || telegramMessage.animation;
+      const location = await tgResolveFileLocation(srcVideo.file_id);
+      const filePath = location.type === 'source'
+        ? location.value
+        : (tmpFile = await downloadUrlToTempFile(location.value, srcVideo.mime_type || 'video/mp4'));
+
+      const fileSize = fs.statSync(filePath).size;
+      const uploaded = await userbotClient.uploadFile({
+        file: new GramjsCustomFile(path.basename(filePath), fileSize, filePath),
+        workers: 2,
+      });
+      media = new GramjsApi.InputMediaUploadedDocument({
+        file: uploaded,
+        mimeType: srcVideo.mime_type || 'video/mp4',
+        attributes: [
+          new GramjsApi.DocumentAttributeVideo({
+            duration: srcVideo.duration || 0,
+            w: srcVideo.width || 0,
+            h: srcVideo.height || 0,
+          }),
+        ],
+      });
+    }
+
+    await userbotClient.invoke(new GramjsApi.stories.SendStory({
+      peer,
+      media,
+      caption: caption || undefined,
+      privacyRules: [new GramjsApi.InputPrivacyValueAllowAll()],
+      period: 86400,
+      noforwards: false,
+    }));
+
+    log('Posted to Telegram Stories', { channel: destination.chat_username || destination.chat_id });
+    return { ok: true };
+  } finally {
+    if (tmpFile) {
+      activeTempFiles.delete(tmpFile);
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    }
+  }
 };
 
 const makeProgressLogger = (label) => {
@@ -1612,6 +1763,10 @@ const sendToDestination = async (destination, text, attachments, meta = {}) => {
     return sendToInstagram(destination, text, meta.telegramMessage || null);
   }
 
+  if (destination.network === 'telegram_stories') {
+    return sendToTelegramStories(destination, text, meta.telegramMessage || null);
+  }
+
   if (destination.network === 'youtube') {
     return sendToYouTube(destination, text, meta.telegramMessage || null);
   }
@@ -1975,6 +2130,12 @@ const bootstrap = async () => {
     });
   });
 
+  await initUserbotClient().catch((err) => {
+    log('Userbot init failed (non-fatal — Telegram Stories destination disabled)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
   const [tgMe, maxMe] = await Promise.all([
     telegram.getMe(),
     maxBot.api.getMyInfo(),
@@ -2121,6 +2282,7 @@ const cleanupAndExit = (signal) => {
       try { fs.unlinkSync(file); } catch { /* ignore */ }
     }
   }
+  if (userbotClient) userbotClient.disconnect().catch(() => {});
   process.exit(0);
 };
 

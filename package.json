@@ -11,7 +11,8 @@
     "bridge:discover": "node scripts/bridge-init.js --merge",
     "bridge:pair": "node scripts/bridge-init.js --add-pair",
     "bridge:cli": "node ./bin/max-bot-bridge.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "userbot:auth": "node scripts/userbot-auth.js"
   },
   "engines": {
     "node": ">=18.18.0"

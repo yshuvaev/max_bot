@@ -7,3 +7,4 @@ config/discovered-chats.json
 config/settings.json
 config/backups/
 .mtproto_session
+.userbot_session
